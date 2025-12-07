@@ -33,7 +33,7 @@ var (
 	
 	// --- Experiment settings ---
 	// TODO: Set these before running
-	targetJIDString = "9481818626@s.whatsapp.net" // Replace with target phone number
+	targetJIDString = "number@s.whatsapp.net" // Replace with target phone number
 	probeInterval   = 2 * time.Minute             // How often to send reaction probes
 	emojiList       = []string{"👍", "❤️", "😊", "🔥", "👀"} // Emojis to cycle through
 	emojiIndex      = 0
