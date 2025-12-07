@@ -1,129 +1,296 @@
-// Copyright 2023 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
-// Outyet is a web server that announces whether or not a particular Go version
-// has been tagged.
 package main
 
 import (
-	"expvar"
-	"flag"
+	"context"
+	"encoding/csv"
 	"fmt"
-	"html/template"
 	"log"
-	"net/http"
+	"os"
+	"os/signal"
 	"sync"
 	"time"
+
+	_ "github.com/mattn/go-sqlite3"
+	"github.com/mdp/qrterminal/v3"
+	"go.mau.fi/whatsmeow"
+	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/store/sqlstore"
+	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
+	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/proto"
 )
 
-// Command-line flags.
 var (
-	httpAddr   = flag.String("addr", "0.0.0.0:8080", "Listen address")
-	pollPeriod = flag.Duration("poll", 5*time.Second, "Poll period")
-	version    = flag.String("version", "1.20", "Go version")
+	sendTimes   = make(map[string]time.Time)
+	sendTimesMu sync.Mutex
+
+	lastMessageCache      = make(map[string]types.MessageInfo)
+	lastMessageCacheMu    sync.Mutex
+
+	csvWriter *csv.Writer
+	csvFile   *os.File
+	
+	// --- Experiment settings ---
+	// TODO: Set these before running
+	targetJIDString = "9481818626@s.whatsapp.net" // Replace with target phone number
+	probeInterval   = 2 * time.Minute             // How often to send reaction probes
+	emojiList       = []string{"👍", "❤️", "😊", "🔥", "👀"} // Emojis to cycle through
+	emojiIndex      = 0
+	// --- End settings ---
 )
 
-const baseChangeURL = "https://go.googlesource.com/go/+/"
+func initCSV() {
+	var err error
+	csvFile, err = os.OpenFile("user_activity_log.csv", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatalf("Failed to open CSV file: %v", err)
+	}
+
+	info, err := csvFile.Stat()
+	if err != nil {
+		log.Fatalf("Failed to stat CSV file: %v", err)
+	}
+	
+	csvWriter = csv.NewWriter(csvFile)
+	
+	if info.Size() == 0 {
+		header := []string{"timestamp", "probe_sent_ts", "receipt_recv_ts", "rtt_ms", "receipt_type", "user_status", "emoji_used"}
+		csvWriter.Write(header)
+		csvWriter.Flush()
+	}
+}
+
+func handleEvent(client *whatsmeow.Client, evt interface{}) {
+	switch v := evt.(type) {
+	case *events.Message:
+		// Update last message cache when new messages arrive from target
+		jidStr := v.Info.Chat.String()
+		if jidStr == targetJIDString && !v.Info.IsFromMe {
+			lastMessageCacheMu.Lock()
+			lastMessageCache[jidStr] = v.Info
+			lastMessageCacheMu.Unlock()
+			log.Printf("Updated anchor message: New message from %s (ID: %s)", jidStr, v.Info.ID)
+		}
+
+	case *events.Receipt:
+		handleReceipt(v)
+	}
+}
+
+func handleReceipt(receipt *events.Receipt) {
+	recvTime := time.Now().UTC()
+	receiptType := "unknown"
+	userStatus := "unknown"
+
+	switch receipt.Type {
+	case types.ReceiptTypeDelivered:
+		receiptType = "delivered"
+		userStatus = "offline_or_no_internet"
+	case types.ReceiptTypeRead:
+		receiptType = "read"
+		userStatus = "active_reading"
+	case types.ReceiptTypePlayed:
+		receiptType = "played"
+		userStatus = "active_viewing"
+	}
+
+	for _, msgID := range receipt.MessageIDs {
+		sendTimesMu.Lock()
+		tSend, ok := sendTimes[msgID]
+		if ok {
+			delete(sendTimes, msgID)
+		}
+		sendTimesMu.Unlock()
+
+		if !ok {
+			continue
+		}
+
+		rtt := recvTime.Sub(tSend)
+		rttMs := float64(rtt.Microseconds()) / 1000.0
+
+		record := []string{
+			time.Now().UTC().Format(time.RFC3339),
+			tSend.Format(time.RFC3339Nano),
+			recvTime.Format(time.RFC3339Nano),
+			fmt.Sprintf("%.3f", rttMs),
+			receiptType,
+			userStatus,
+			"", // emoji field - will be filled if needed
+		}
+		csvWriter.Write(record)
+		csvWriter.Flush()
+
+		fmt.Printf("[%s] User Status: %s | RTT: %.3f ms | Receipt: %s\n",
+			time.Now().Format("15:04:05"), userStatus, rttMs, receiptType)
+			
+		// Analyze activity based on RTT
+		analyzeUserActivity(rttMs, receiptType)
+	}
+}
+
+func analyzeUserActivity(rttMs float64, receiptType string) {
+	// Based on research: Different RTT ranges indicate different activity states
+	if receiptType == "read" {
+		if rttMs < 100 {
+			log.Printf("  → Analysis: User likely has screen ON, app in FOREGROUND (Fast RTT)")
+		} else if rttMs < 500 {
+			log.Printf("  → Analysis: User likely has screen ON, app in BACKGROUND")
+		} else if rttMs < 2000 {
+			log.Printf("  → Analysis: User likely has screen OFF or device in low power mode")
+		} else {
+			log.Printf("  → Analysis: User likely on slow connection or device sleeping")
+		}
+	}
+}
+
+func sendReactionProbe(client *whatsmeow.Client, jid types.JID, anchorMessageInfo types.MessageInfo) {
+	tSend := time.Now().UTC()
+	
+	// Cycle through emojis
+	emoji := emojiList[emojiIndex%len(emojiList)]
+	emojiIndex++
+
+	msg := &waProto.Message{
+		ReactionMessage: &waProto.ReactionMessage{
+			Key: &waProto.MessageKey{
+				RemoteJID: proto.String(jid.String()),
+				FromMe:    proto.Bool(anchorMessageInfo.IsFromMe),
+				ID:        proto.String(anchorMessageInfo.ID),
+			},
+			Text:              proto.String(emoji),
+			SenderTimestampMS: proto.Int64(tSend.UnixMilli()),
+		},
+	}
+
+	if jid.Server == types.GroupServer {
+		msg.ReactionMessage.Key.Participant = proto.String(anchorMessageInfo.Sender.String())
+	}
+
+	resp, err := client.SendMessage(context.Background(), jid, msg)
+	if err != nil {
+		log.Printf("Failed to send reaction probe: %v", err)
+		return
+	}
+
+	sendTimesMu.Lock()
+	sendTimes[resp.ID] = tSend
+	sendTimesMu.Unlock()
+
+	log.Printf("Sent reaction probe '%s' with ID: %s", emoji, resp.ID)
+}
+
+func getLastMessageFromChat(client *whatsmeow.Client, jid types.JID) (types.MessageInfo, error) {
+	// First check cache
+	lastMessageCacheMu.Lock()
+	if cached, ok := lastMessageCache[jid.String()]; ok {
+		lastMessageCacheMu.Unlock()
+		return cached, nil
+	}
+	lastMessageCacheMu.Unlock()
+
+	// Try to get history (this may not work in all whatsmeow versions)
+	// As fallback, we'll wait for incoming messages to update cache
+	return types.MessageInfo{}, fmt.Errorf("no cached message found - waiting for new messages")
+}
 
 func main() {
-	flag.Parse()
-	changeURL := fmt.Sprintf("%sgo%s", baseChangeURL, *version)
-	http.Handle("/", NewServer(*version, changeURL, *pollPeriod))
-	log.Printf("serving http://%s", *httpAddr)
-	log.Fatal(http.ListenAndServe(*httpAddr, nil))
-}
+	initCSV()
+	defer csvFile.Close()
 
-// Exported variables for monitoring the server.
-// These are exported via HTTP as a JSON object at /debug/vars.
-var (
-	hitCount       = expvar.NewInt("hitCount")
-	pollCount      = expvar.NewInt("pollCount")
-	pollError      = expvar.NewString("pollError")
-	pollErrorCount = expvar.NewInt("pollErrorCount")
-)
-
-// Server implements the outyet server.
-// It serves the user interface (it's an http.Handler)
-// and polls the remote repository for changes.
-type Server struct {
-	version string
-	url     string
-	period  time.Duration
-
-	mu  sync.RWMutex // protects the yes variable
-	yes bool
-}
-
-// NewServer returns an initialized outyet server.
-func NewServer(version, url string, period time.Duration) *Server {
-	s := &Server{version: version, url: url, period: period}
-	go s.poll()
-	return s
-}
-
-// poll polls the change URL for the specified period until the tag exists.
-// Then it sets the Server's yes field true and exits.
-func (s *Server) poll() {
-	for !isTagged(s.url) {
-		pollSleep(s.period)
-	}
-	s.mu.Lock()
-	s.yes = true
-	s.mu.Unlock()
-	pollDone()
-}
-
-// Hooks that may be overridden for integration tests.
-var (
-	pollSleep = time.Sleep
-	pollDone  = func() {}
-)
-
-// isTagged makes an HTTP HEAD request to the given URL and reports whether it
-// returned a 200 OK response.
-func isTagged(url string) bool {
-	pollCount.Add(1)
-	r, err := http.Head(url)
+	dbLog := waLog.Stdout("Database", "ERROR", true)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:whisper.db?_foreign_keys=on", dbLog)
 	if err != nil {
-		log.Print(err)
-		pollError.Set(err.Error())
-		pollErrorCount.Add(1)
-		return false
+		panic(err)
 	}
-	return r.StatusCode == http.StatusOK
-}
 
-// ServeHTTP implements the HTTP user interface.
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	hitCount.Add(1)
-	s.mu.RLock()
-	data := struct {
-		URL     string
-		Version string
-		Yes     bool
-	}{
-		s.url,
-		s.version,
-		s.yes,
-	}
-	s.mu.RUnlock()
-	err := tmpl.Execute(w, data)
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
-		log.Print(err)
+		panic(err)
 	}
-}
 
-// tmpl is the HTML template that drives the user interface.
-var tmpl = template.Must(template.New("tmpl").Parse(`
-<!DOCTYPE html><html><body><center>
-	<h2>Is Go {{.Version}} out yet?</h2>
-	<h1>
-	{{if .Yes}}
-		<a href="{{.URL}}">YES!</a>
-	{{else}}
-		No. :-(
-	{{end}}
-	</h1>
-</center></body></html>
-`))
+	clientLog := waLog.Stdout("Client", "ERROR", true)
+	client := whatsmeow.NewClient(deviceStore, clientLog)
+	
+	// Add event handler with client reference
+	client.AddEventHandler(func(evt interface{}) {
+		handleEvent(client, evt)
+	})
+
+	if client.Store.ID == nil {
+		qrChan, _ := client.GetQRChannel(context.Background())
+		err = client.Connect()
+		if err != nil {
+			log.Printf("Connection initiated, waiting for QR scan...")
+		}
+		for evt := range qrChan {
+			if evt.Event == "code" {
+				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				fmt.Println("QR code generated. Scan with WhatsApp on your phone.")
+			} else {
+				fmt.Println("Login event:", evt.Event)
+			}
+		}
+	} else {
+		err = client.Connect()
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	targetJID, err := types.ParseJID(targetJIDString)
+	if err != nil {
+		log.Fatalf("Failed to parse target JID: %v. Edit 'targetJIDString' in code.", err)
+	}
+
+	log.Println("═══════════════════════════════════════════════════════")
+	log.Println("  WhatsApp User Activity Tracker")
+	log.Println("═══════════════════════════════════════════════════════")
+	log.Printf("Target User: %s", targetJID)
+	log.Printf("Probe Interval: %v", probeInterval)
+	log.Printf("Output File: user_activity_log.csv")
+	log.Println("═══════════════════════════════════════════════════════")
+	log.Println("IMPORTANT: Send a message to the target user first,")
+	log.Println("or wait for them to send you a message.")
+	log.Println("The bot will react to their last message.")
+	log.Println("═══════════════════════════════════════════════════════")
+
+	// Wait a bit for messages to sync
+	log.Println("Waiting 5 seconds for message sync...")
+	time.Sleep(5 * time.Second)
+
+	log.Println("Monitoring started. Press Ctrl+C to stop.")
+	log.Println("═══════════════════════════════════════════════════════")
+
+	ticker := time.NewTicker(probeInterval)
+	defer ticker.Stop()
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+
+	// Start probing routine
+	go func() {
+		for {
+			// Try to get current anchor message
+			currentAnchor, err := getLastMessageFromChat(client, targetJID)
+			if err != nil {
+				log.Printf("Waiting for messages from target user...")
+				time.Sleep(10 * time.Second)
+				continue
+			}
+			
+			sendReactionProbe(client, targetJID, currentAnchor)
+			
+			// Wait for next interval
+			<-ticker.C
+		}
+	}()
+
+	<-c
+	log.Println("\n═══════════════════════════════════════════════════════")
+	log.Println("Shutdown signal received. Disconnecting...")
+	client.Disconnect()
+	log.Println("Disconnected. Activity log saved to user_activity_log.csv")
+	log.Println("═══════════════════════════════════════════════════════")
+}
